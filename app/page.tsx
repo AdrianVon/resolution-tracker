@@ -14,7 +14,7 @@ type Task = {
   text: string;
   done: boolean;
   deadline?: string; // YYYY-MM-DD
-  details?: string; // optional details (set on create/edit)
+  details?: string; // optional (set on create/edit)
 };
 
 type Resolution = {
@@ -28,7 +28,18 @@ type Resolution = {
   createdAt: string;
 };
 
-const STORAGE_KEY = "resolution-tracker:v8";
+type CheckInType = "Daily" | "Weekly" | "Blocked" | "Win" | "Other";
+
+type CheckIn = {
+  id: string;
+  createdAt: string;
+  text: string;
+  resolutionId?: string; // optional link to a specific resolution
+  type: CheckInType;
+};
+
+const STORAGE_KEY = "resolution-tracker:v10";
+const LEGACY_KEYS = ["resolution-tracker:v9", "resolution-tracker:v8"] as const;
 
 function uid() {
   return crypto.randomUUID();
@@ -48,11 +59,29 @@ function formatDateTime(iso: string) {
   return d.toLocaleString();
 }
 
+function daysSince(iso?: string) {
+  if (!iso) return null;
+  const then = new Date(iso).getTime();
+  const now = Date.now();
+  const diffMs = Math.max(0, now - then);
+  return Math.floor(diffMs / (1000 * 60 * 60 * 24));
+}
+
+function safeParse<T>(raw: string | null): T | null {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
 export default function Page() {
   const [resolutions, setResolutions] = useState<Resolution[]>([]);
-  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [checkIns, setCheckIns] = useState<CheckIn[]>([]);
 
-  // Create Resolution modal state
+  // Add Resolution modal
+  const [isModalOpen, setIsModalOpen] = useState(false);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [resolutionDeadline, setResolutionDeadline] = useState("");
@@ -60,49 +89,81 @@ export default function Page() {
     { text: "", deadline: "", details: "" },
   ]);
 
-  // Per-resolution: Add Note UI state
+  // Check-In modal
+  const [isCheckInOpen, setIsCheckInOpen] = useState(false);
+  const [checkInText, setCheckInText] = useState("");
+  const [checkInResolutionId, setCheckInResolutionId] = useState<string>(""); // "" => All/General
+  const [checkInType, setCheckInType] = useState<CheckInType>("Daily");
+
+  // Check-In edit
+  const [editingCheckInId, setEditingCheckInId] = useState<string | null>(null);
+  const [editCheckInText, setEditCheckInText] = useState("");
+  const [editCheckInResolutionId, setEditCheckInResolutionId] = useState<string>("");
+  const [editCheckInType, setEditCheckInType] = useState<CheckInType>("Daily");
+
+  // Per-resolution: Notes UI
   const [noteDraftByRes, setNoteDraftByRes] = useState<Record<string, string>>({});
   const [noteTaskAttachByRes, setNoteTaskAttachByRes] = useState<Record<string, string>>({});
   const [noteOpenByRes, setNoteOpenByRes] = useState<Record<string, boolean>>({});
 
-  // NOTE EDIT state
+  // Note edit
   const [editingNoteKey, setEditingNoteKey] = useState<string | null>(null); // `${resId}:${noteId}`
   const [editNoteText, setEditNoteText] = useState("");
   const [editNoteTaskId, setEditNoteTaskId] = useState<string>(""); // "" => General
 
-  // Per-resolution: Add Task UI state (AFTER creation)
+  // Add Task after creation
   const [addTaskOpenByRes, setAddTaskOpenByRes] = useState<Record<string, boolean>>({});
   const [addTaskTextByRes, setAddTaskTextByRes] = useState<Record<string, string>>({});
   const [addTaskDeadlineByRes, setAddTaskDeadlineByRes] = useState<Record<string, string>>({});
   const [addTaskDetailsByRes, setAddTaskDetailsByRes] = useState<Record<string, string>>({});
 
-  // Per-task: Edit UI state
+  // Task edit
   const [editingTaskKey, setEditingTaskKey] = useState<string | null>(null); // `${resId}:${taskId}`
   const [editTaskText, setEditTaskText] = useState("");
   const [editTaskDeadline, setEditTaskDeadline] = useState("");
   const [editTaskDetails, setEditTaskDetails] = useState("");
 
-  // Per-resolution: Edit UI state (name + description)
+  // Resolution edit
   const [editingResolutionId, setEditingResolutionId] = useState<string | null>(null);
   const [editResName, setEditResName] = useState("");
   const [editResDescription, setEditResDescription] = useState("");
 
-  // load/save localStorage
+  // ---------- load/save localStorage ----------
   useEffect(() => {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return;
-    try {
-      const parsed = JSON.parse(raw) as { resolutions: Resolution[] };
-      if (parsed?.resolutions) setResolutions(parsed.resolutions);
-    } catch {
-      // ignore
+    const current = safeParse<{ resolutions?: Resolution[]; checkIns?: CheckIn[] }>(
+      localStorage.getItem(STORAGE_KEY)
+    );
+    if (current) {
+      setResolutions(current.resolutions ?? []);
+      setCheckIns(current.checkIns ?? []);
+      return;
+    }
+
+    // Try legacy keys in order
+    for (const k of LEGACY_KEYS) {
+      const legacy = safeParse<any>(localStorage.getItem(k));
+      if (!legacy) continue;
+
+      const legacyResolutions: Resolution[] = legacy.resolutions ?? [];
+      const legacyCheckIns: CheckIn[] = (legacy.checkIns ?? []).map((ci: any) => ({
+        id: String(ci.id ?? uid()),
+        createdAt: String(ci.createdAt ?? new Date().toISOString()),
+        text: String(ci.text ?? ""),
+        resolutionId: ci.resolutionId ? String(ci.resolutionId) : undefined,
+        type: (ci.type as CheckInType) ?? "Daily",
+      }));
+
+      setResolutions(legacyResolutions);
+      setCheckIns(legacyCheckIns);
+      return;
     }
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ resolutions }));
-  }, [resolutions]);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ resolutions, checkIns }));
+  }, [resolutions, checkIns]);
 
+  // ---------- computed ----------
   const overall = useMemo(() => {
     const totalGoals = resolutions.length;
 
@@ -128,6 +189,25 @@ export default function Page() {
     };
   }, [resolutions]);
 
+  const latestCheckIn = useMemo(() => (checkIns.length ? checkIns[0] : null), [checkIns]);
+  const daysSinceLastCheckIn = useMemo(
+    () => daysSince(latestCheckIn?.createdAt ?? undefined),
+    [latestCheckIn]
+  );
+
+  function resolutionNameById(id?: string) {
+    if (!id) return "All (General)";
+    const r = resolutions.find((x) => x.id === id);
+    return r ? r.name : "Resolution (deleted)";
+  }
+
+  function taskLabel(res: Resolution, taskId?: string) {
+    if (!taskId) return "General";
+    const t = res.tasks.find((x) => x.id === taskId);
+    return t ? `Task: ${t.text}` : "Task (deleted)";
+  }
+
+  // ---------- Resolution modal ----------
   function resetModal() {
     setName("");
     setDescription("");
@@ -191,10 +271,13 @@ export default function Page() {
   function deleteResolution(resolutionId: string) {
     if (!confirm("Delete this resolution?")) return;
     setResolutions((prev) => prev.filter((r) => r.id !== resolutionId));
+
     if (editingResolutionId === resolutionId) cancelEditResolution();
     if (editingNoteKey?.startsWith(`${resolutionId}:`)) cancelEditNote();
+    if (editingTaskKey?.startsWith(`${resolutionId}:`)) cancelEditTask();
   }
 
+  // ---------- Tasks ----------
   function toggleTaskDone(resolutionId: string, taskId: string) {
     setResolutions((prev) =>
       prev.map((r) =>
@@ -208,6 +291,7 @@ export default function Page() {
   function nextTask(res: Resolution) {
     const remaining = res.tasks.filter((t) => !t.done);
     if (remaining.length === 0) return null;
+
     const withDates = remaining.filter((t) => t.deadline);
     if (withDates.length > 0) {
       withDates.sort((a, b) => (a.deadline! < b.deadline! ? -1 : 1));
@@ -247,7 +331,6 @@ export default function Page() {
     if (editingNoteKey === `${resId}:${noteId}`) cancelEditNote();
   }
 
-  // Note editing
   function startEditNote(resId: string, note: Note) {
     setEditingNoteKey(`${resId}:${note.id}`);
     setEditNoteText(note.text);
@@ -341,10 +424,6 @@ export default function Page() {
       })
     );
 
-    // If editing a note attached to this task, keep it open but "General" it
-    if (editingNoteKey?.startsWith(`${resId}:`)) {
-      // no-op
-    }
     if (editingTaskKey === `${resId}:${taskId}`) cancelEditTask();
   }
 
@@ -365,7 +444,7 @@ export default function Page() {
     const n = editResName.trim();
     if (!n) return alert("Resolution name can't be empty.");
 
-    const d = editResDescription;
+    const d = editResDescription; // preserve newlines
 
     setResolutions((prev) => prev.map((r) => (r.id === resId ? { ...r, name: n, description: d } : r)));
     cancelEditResolution();
@@ -399,10 +478,143 @@ export default function Page() {
     setAddTaskOpenByRes((p) => ({ ...p, [resId]: false }));
   }
 
-  function taskLabel(res: Resolution, taskId?: string) {
-    if (!taskId) return "General";
-    const t = res.tasks.find((x) => x.id === taskId);
-    return t ? `Task: ${t.text}` : "Task (deleted)";
+  // ---------- Check-Ins ----------
+  const templates: Record<CheckInType, string> = {
+    Daily: `Daily Check-In
+
+What went well today?
+- 
+
+What got in the way?
+- 
+
+What’s the next move (1–2 actions)?
+- 
+
+Confidence (1–10): 
+Energy (1–10): 
+`,
+    Weekly: `Weekly Review
+
+Wins:
+- 
+
+Progress:
+- 
+
+Stuck points:
+- 
+
+Focus for next week (top 1–3):
+- 
+`,
+    Blocked: `Blocked Update
+
+What are you blocked on?
+- 
+
+What do you need (time / info / decision / help)?
+- 
+
+What’s the smallest next step?
+- 
+`,
+    Win: `Win Update
+
+What did you accomplish?
+- 
+
+Why does it matter?
+- 
+
+How will you carry this momentum forward?
+- 
+`,
+    Other: `Update
+
+What’s happening?
+- 
+
+What’s next?
+- 
+`,
+  };
+
+  function openCheckIn(preset?: { type?: CheckInType; resolutionId?: string; text?: string }) {
+    setCheckInType(preset?.type ?? "Daily");
+    setCheckInResolutionId(preset?.resolutionId ?? "");
+    setCheckInText(preset?.text ?? "");
+    setIsCheckInOpen(true);
+  }
+
+  function closeCheckIn() {
+    setIsCheckInOpen(false);
+  }
+
+  function applyTemplate(t: CheckInType) {
+    setCheckInType(t);
+    setCheckInText(templates[t]);
+  }
+
+  function addCheckIn() {
+    const text = checkInText.trim();
+    if (!text) return alert("Write something for your update.");
+
+    const resId = checkInResolutionId.trim();
+
+    const newCheckIn: CheckIn = {
+      id: uid(),
+      createdAt: new Date().toISOString(),
+      text,
+      resolutionId: resId ? resId : undefined,
+      type: checkInType,
+    };
+
+    setCheckIns((prev) => [newCheckIn, ...prev]);
+    closeCheckIn();
+  }
+
+  function startEditCheckIn(ci: CheckIn) {
+    setEditingCheckInId(ci.id);
+    setEditCheckInText(ci.text);
+    setEditCheckInResolutionId(ci.resolutionId ?? "");
+    setEditCheckInType(ci.type ?? "Daily");
+  }
+
+  function cancelEditCheckIn() {
+    setEditingCheckInId(null);
+    setEditCheckInText("");
+    setEditCheckInResolutionId("");
+    setEditCheckInType("Daily");
+  }
+
+  function saveEditCheckIn(id: string) {
+    const text = editCheckInText.trim();
+    if (!text) return alert("Update can't be empty.");
+
+    const resId = editCheckInResolutionId.trim();
+    const t = editCheckInType;
+
+    setCheckIns((prev) =>
+      prev.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              text,
+              resolutionId: resId ? resId : undefined,
+              type: t,
+            }
+          : c
+      )
+    );
+
+    cancelEditCheckIn();
+  }
+
+  function deleteCheckIn(id: string) {
+    if (!confirm("Delete this update?")) return;
+    setCheckIns((prev) => prev.filter((c) => c.id !== id));
+    if (editingCheckInId === id) cancelEditCheckIn();
   }
 
   return (
@@ -410,12 +622,19 @@ export default function Page() {
       <header className="mb-8 flex items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">Resolution Tracker</h1>
-          <p className="mt-2 text-sm text-zinc-600">Notes dropdown now supports edit.</p>
+          <p className="mt-2 text-sm text-zinc-600">
+            Notes stay inside resolutions/tasks. Updates are separate and time-based.
+          </p>
         </div>
 
-        <button onClick={openModal} className="rounded-md bg-black px-4 py-2 text-white">
-          Add Resolution
-        </button>
+        <div className="flex gap-2">
+          <button onClick={() => openCheckIn()} className="rounded-md border px-4 py-2">
+            Check In
+          </button>
+          <button onClick={openModal} className="rounded-md bg-black px-4 py-2 text-white">
+            Add Resolution
+          </button>
+        </div>
       </header>
 
       {/* Overall tracker */}
@@ -439,7 +658,10 @@ export default function Page() {
               </div>
             </div>
             <div className="mt-2 h-3 w-full rounded-full bg-zinc-100">
-              <div className="h-3 rounded-full bg-black" style={{ width: `${clamp(overall.goalCompletion, 0, 100)}%` }} />
+              <div
+                className="h-3 rounded-full bg-black"
+                style={{ width: `${clamp(overall.goalCompletion, 0, 100)}%` }}
+              />
             </div>
           </div>
 
@@ -454,10 +676,187 @@ export default function Page() {
               </div>
             </div>
             <div className="mt-2 h-3 w-full rounded-full bg-zinc-100">
-              <div className="h-3 rounded-full bg-black" style={{ width: `${clamp(overall.taskCompletion, 0, 100)}%` }} />
+              <div
+                className="h-3 rounded-full bg-black"
+                style={{ width: `${clamp(overall.taskCompletion, 0, 100)}%` }}
+              />
             </div>
           </div>
         </div>
+      </section>
+
+      {/* Updates */}
+      <section className="mb-8 rounded-lg border p-6">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <div className="text-sm font-semibold">Updates</div>
+            <div className="mt-1 text-sm text-zinc-600">
+              Log a daily/weekly check-in. Later we’ll run NLP + sentiment on these.
+            </div>
+          </div>
+          <button
+            onClick={() => openCheckIn()}
+            className="rounded-md bg-black px-3 py-2 text-sm text-white"
+          >
+            New update
+          </button>
+        </div>
+
+        {/* Nudge banner */}
+        {daysSinceLastCheckIn !== null && daysSinceLastCheckIn >= 1 ? (
+          <div className="mt-4 rounded-md border bg-zinc-50 p-4">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-sm text-zinc-700">
+                It’s been{" "}
+                <span className="font-semibold">{daysSinceLastCheckIn}</span>{" "}
+                day{daysSinceLastCheckIn === 1 ? "" : "s"} since your last update.
+              </div>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => openCheckIn({ type: "Daily", text: templates.Daily })}
+                  className="rounded-md border bg-white px-3 py-2 text-sm hover:bg-zinc-50"
+                >
+                  Daily prompt
+                </button>
+                <button
+                  onClick={() => openCheckIn({ type: "Weekly", text: templates.Weekly })}
+                  className="rounded-md border bg-white px-3 py-2 text-sm hover:bg-zinc-50"
+                >
+                  Weekly prompt
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {latestCheckIn ? (
+          <div className="mt-4 rounded-md bg-zinc-50 p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex-1">
+                <div className="text-xs font-medium text-zinc-600">
+                  {latestCheckIn.type} • {resolutionNameById(latestCheckIn.resolutionId)} •{" "}
+                  {formatDateTime(latestCheckIn.createdAt)}
+                </div>
+                <div className="mt-2 whitespace-pre-wrap text-sm text-zinc-900">{latestCheckIn.text}</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => startEditCheckIn(latestCheckIn)}
+                  className="text-xs text-zinc-500 hover:text-zinc-900"
+                >
+                  Edit
+                </button>
+                <button
+                  onClick={() => deleteCheckIn(latestCheckIn.id)}
+                  className="text-xs text-zinc-500 hover:text-zinc-900"
+                >
+                  Delete
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 text-sm text-zinc-600">No updates yet. Click “Check In”.</div>
+        )}
+
+        <details className="mt-4">
+          <summary className="cursor-pointer text-sm font-medium">History ({checkIns.length})</summary>
+          <div className="mt-3 max-h-[340px] overflow-y-auto rounded-md border bg-white p-3">
+            {checkIns.length === 0 ? (
+              <div className="text-sm text-zinc-600">No history yet.</div>
+            ) : (
+              <ul className="space-y-2">
+                {checkIns.map((ci) => {
+                  const isEditing = editingCheckInId === ci.id;
+
+                  return (
+                    <li key={ci.id} className="rounded-md bg-zinc-50 p-3">
+                      {!isEditing ? (
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="flex-1">
+                            <div className="text-xs font-medium text-zinc-600">
+                              {ci.type} • {resolutionNameById(ci.resolutionId)} • {formatDateTime(ci.createdAt)}
+                            </div>
+                            <div className="mt-2 whitespace-pre-wrap text-sm text-zinc-900">{ci.text}</div>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => startEditCheckIn(ci)}
+                              className="text-xs text-zinc-500 hover:text-zinc-900"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              onClick={() => deleteCheckIn(ci.id)}
+                              className="text-xs text-zinc-500 hover:text-zinc-900"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="space-y-2">
+                          <div className="grid gap-2 md:grid-cols-2">
+                            <div>
+                              <label className="text-xs text-zinc-600">Type</label>
+                              <select
+                                className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                                value={editCheckInType}
+                                onChange={(e) => setEditCheckInType(e.target.value as CheckInType)}
+                              >
+                                {(["Daily", "Weekly", "Blocked", "Win", "Other"] as CheckInType[]).map((t) => (
+                                  <option key={t} value={t}>
+                                    {t}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+
+                            <div>
+                              <label className="text-xs text-zinc-600">Attach to a resolution (optional)</label>
+                              <select
+                                className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                                value={editCheckInResolutionId}
+                                onChange={(e) => setEditCheckInResolutionId(e.target.value)}
+                              >
+                                <option value="">All (General)</option>
+                                {resolutions.map((r) => (
+                                  <option key={r.id} value={r.id}>
+                                    {r.name}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                          </div>
+
+                          <textarea
+                            className="w-full rounded-md border px-3 py-2 text-sm"
+                            rows={5}
+                            value={editCheckInText}
+                            onChange={(e) => setEditCheckInText(e.target.value)}
+                            placeholder="Update..."
+                          />
+
+                          <div className="flex justify-end gap-2">
+                            <button onClick={cancelEditCheckIn} className="rounded-md border px-3 py-2 text-sm">
+                              Cancel
+                            </button>
+                            <button
+                              onClick={() => saveEditCheckIn(ci.id)}
+                              className="rounded-md bg-black px-3 py-2 text-sm text-white"
+                            >
+                              Save
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
+          </div>
+        </details>
       </section>
 
       {/* Snapshots */}
@@ -516,9 +915,7 @@ export default function Page() {
                       Priority: {r.priority ?? "AI (later)"}
                     </span>
                     {r.deadline ? (
-                      <span className="rounded-full bg-zinc-100 px-3 py-1 text-zinc-700">
-                        Deadline: {r.deadline}
-                      </span>
+                      <span className="rounded-full bg-zinc-100 px-3 py-1 text-zinc-700">Deadline: {r.deadline}</span>
                     ) : null}
                   </div>
                 </div>
@@ -538,7 +935,7 @@ export default function Page() {
                 </div>
               </div>
 
-              {/* Progress */}
+              {/* Progress bar */}
               <div className="mt-4">
                 <div className="h-2 w-full rounded-full bg-zinc-100">
                   <div className="h-2 rounded-full bg-black" style={{ width: `${clamp(progress, 0, 100)}%` }} />
@@ -558,7 +955,7 @@ export default function Page() {
                 )}
               </div>
 
-              {/* Tasks (with Add Task after creation) */}
+              {/* Tasks */}
               <details className="mt-5">
                 <summary className="cursor-pointer text-sm font-medium">Tasks ({done}/{total})</summary>
 
@@ -703,7 +1100,7 @@ export default function Page() {
                 </ul>
               </details>
 
-              {/* Notes dropdown at bottom with Edit */}
+              {/* Notes dropdown at bottom */}
               <details className="mt-5">
                 <summary className="cursor-pointer text-sm font-medium">Notes ({r.notes.length})</summary>
 
@@ -751,7 +1148,10 @@ export default function Page() {
                         >
                           Cancel
                         </button>
-                        <button onClick={() => addNote(r.id)} className="rounded-md bg-black px-3 py-2 text-sm text-white">
+                        <button
+                          onClick={() => addNote(r.id)}
+                          className="rounded-md bg-black px-3 py-2 text-sm text-white"
+                        >
                           Save note
                         </button>
                       </div>
@@ -854,7 +1254,9 @@ export default function Page() {
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <h3 className="text-lg font-semibold">Add Resolution</h3>
-                  <p className="mt-1 text-sm text-zinc-600">Description supports new lines. Tasks can include optional details.</p>
+                  <p className="mt-1 text-sm text-zinc-600">
+                    Description supports new lines. Tasks can include optional details.
+                  </p>
                 </div>
                 <button onClick={closeModal} className="text-sm text-zinc-600 hover:text-black">
                   Close
@@ -948,6 +1350,97 @@ export default function Page() {
                   <button onClick={createResolution} className="rounded-md bg-black px-4 py-2 text-white">
                     Create
                   </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Check-In Modal */}
+      {isCheckInOpen ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-2xl rounded-lg bg-white shadow-lg max-h-[85vh] overflow-hidden flex flex-col">
+            <div className="p-6 pb-3">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h3 className="text-lg font-semibold">Check In</h3>
+                  <p className="mt-1 text-sm text-zinc-600">
+                    Use a prompt template or write freely. Later: sentiment + intelligent feedback.
+                  </p>
+                </div>
+                <button onClick={closeCheckIn} className="text-sm text-zinc-600 hover:text-black">
+                  Close
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-y-auto px-6 pb-6">
+              <div className="grid gap-3">
+                <div className="grid gap-3 md:grid-cols-2">
+                  <div>
+                    <label className="text-xs text-zinc-600">Type</label>
+                    <select
+                      className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                      value={checkInType}
+                      onChange={(e) => setCheckInType(e.target.value as CheckInType)}
+                    >
+                      {(["Daily", "Weekly", "Blocked", "Win", "Other"] as CheckInType[]).map((t) => (
+                        <option key={t} value={t}>
+                          {t}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="text-xs text-zinc-600">Attach to a resolution (optional)</label>
+                    <select
+                      className="mt-1 w-full rounded-md border px-3 py-2 text-sm"
+                      value={checkInResolutionId}
+                      onChange={(e) => setCheckInResolutionId(e.target.value)}
+                    >
+                      <option value="">All (General)</option>
+                      {resolutions.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  {(["Daily", "Weekly", "Blocked", "Win", "Other"] as CheckInType[]).map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => applyTemplate(t)}
+                      className="rounded-md border bg-white px-3 py-2 text-sm hover:bg-zinc-50"
+                    >
+                      Use {t} prompt
+                    </button>
+                  ))}
+                </div>
+
+                <textarea
+                  className="w-full rounded-md border px-3 py-2 text-sm"
+                  rows={8}
+                  placeholder={`How are you doing?\nWhat went well?\nWhat got in the way?\nWhat’s the next move?`}
+                  value={checkInText}
+                  onChange={(e) => setCheckInText(e.target.value)}
+                />
+
+                <div className="flex items-center justify-end gap-2">
+                  <button onClick={closeCheckIn} className="rounded-md border px-4 py-2">
+                    Cancel
+                  </button>
+                  <button onClick={addCheckIn} className="rounded-md bg-black px-4 py-2 text-white">
+                    Save update
+                  </button>
+                </div>
+
+                <div className="text-xs text-zinc-500">
+                  Tip: templates are just text. Edit them however you want and it’ll save exactly what you write.
                 </div>
               </div>
             </div>
